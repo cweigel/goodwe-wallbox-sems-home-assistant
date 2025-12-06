@@ -1,118 +1,96 @@
 """
-Support for switch controlling an output of a GoodWe SEMS inverter.
+Support for switch controlling an output of a GoodWe SEMS wallbox.
 
 For more details about this platform, please refer to the documentation at
 https://github.com/TimSoethout/goodwe-sems-home-assistant
 """
 
-from datetime import timedelta
+from __future__ import annotations
+
 import logging
 
 from homeassistant.components.switch import SwitchDeviceClass, SwitchEntity
-from homeassistant.const import CONF_SCAN_INTERVAL
-from homeassistant.core import callback
-from homeassistant.helpers.update_coordinator import (
-    CoordinatorEntity,
-    DataUpdateCoordinator,
-    UpdateFailed,
-)
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import CONF_STATION_ID, DEFAULT_SCAN_INTERVAL, DOMAIN
+from .const import DOMAIN
+from .coordinator import SemsUpdateCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
+SWITCH_VERSION = "0.3.3"
 
-async def async_setup_entry(hass, config_entry, async_add_entities):
+# Jak dlouho po příkazu ON ignorujeme „Waiting/power=0“ a držíme optimistický ON (v sekundách)
+GRACE_ON_SECONDS = 130
+
+# Volitelné – jak dlouho po příkazu OFF tolerujeme, že API může ještě krátce hlásit power>0
+GRACE_OFF_SECONDS = 130
+
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
     """Add switches for passed config_entry in HA."""
-    semsApi = hass.data[DOMAIN][config_entry.entry_id]
-    stationId = config_entry.data[CONF_STATION_ID]
+    runtime = hass.data[DOMAIN][config_entry.entry_id]
+    coordinator: SemsUpdateCoordinator = runtime["coordinator"]
+    api = runtime["api"]
 
-    update_interval = timedelta(
-        seconds=config_entry.data.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
+    _LOGGER.debug(
+        "Setting up SemsSwitch entities (version %s) for entry %s",
+        SWITCH_VERSION,
+        config_entry.entry_id,
     )
 
-    current_state = 0
+    entities: list[SemsSwitch] = []
+    for sn, data in coordinator.data.items():
+        status = data.get("status")
+        power = float(data.get("power", 0) or 0)
+        current_is_on = status == "EVDetail_Status_Title_Charging" or power > 0
+        entities.append(SemsSwitch(coordinator, sn, api, current_is_on))
 
-    async def async_update_data():
-        """Fetch data from API endpoint.
-
-        This is the place to pre-process the data to lookup tables
-        so entities can quickly look up their data.
-        """
-        try:
-            # Note: asyncio.TimeoutError and aiohttp.ClientError are already
-            # handled by the data update coordinator.
-            # async with async_timeout.timeout(10):
-            result = await hass.async_add_executor_job(semsApi.getData, stationId)
-            _LOGGER.debug("Resulting result: %s", result)
-
-            inverter = result
-
-            data = {}
-            if inverter is None:
-                # something went wrong, probably token could not be fetched
-                raise UpdateFailed(
-                    "Error communicating with API, probably token could not be fetched, see debug logs"
-                )
-
-            name = inverter["name"]
-            sn = inverter["sn"]
-            nonlocal current_state
-            current_state = inverter["startStatus"]
-            _LOGGER.debug("Found wallbox attribute %s %s", name, sn)
-            data[sn] = inverter
-
-            # _LOGGER.debug("Resulting data: %s", data)
-            return data
-        # except ApiError as err:
-        except Exception as err:
-            # logging.exception("Something awful happened!")
-            raise UpdateFailed(f"Error communicating with API: {err}")
-
-    coordinator = DataUpdateCoordinator(
-        hass,
-        _LOGGER,
-        # Name of the data. For logging purposes.
-        name="SEMS API switch",
-        update_method=async_update_data,
-        # Polling interval. Will only be polled if there are subscribers.
-        update_interval=update_interval,
-    )
-
-    #
-    # Fetch initial data so we have data when entities subscribe
-    #
-    # If the refresh fails, async_config_entry_first_refresh will
-    # raise ConfigEntryNotReady and setup will try again later
-    #
-    # If you do not want to retry setup on failure, use
-    # coordinator.async_refresh() instead
-    #
-    await coordinator.async_config_entry_first_refresh()
-
-    # _LOGGER.debug("Initial coordinator data: %s", coordinator.data)
-    async_add_entities(
-        SemsSwitch(coordinator, ent, semsApi, current_state == 0)
-        for idx, ent in enumerate(coordinator.data)
-    )
+    async_add_entities(entities)
 
 
 class SemsSwitch(CoordinatorEntity, SwitchEntity):
+    """Switch to start/stop charging."""
+
     _attr_should_poll = False
     _attr_has_entity_name = True
 
-    def __init__(self, coordinator, sn, api, current_is_on: bool):
+    def __init__(
+        self,
+        coordinator: SemsUpdateCoordinator,
+        sn: str,
+        api,
+        current_is_on: bool,
+    ) -> None:
         super().__init__(coordinator)
         self.coordinator = coordinator
         self.api = api
         self.sn = sn
         self._attr_is_on = current_is_on
-        _LOGGER.debug(f"Creating SemsSwitch for Wallbox {self.sn}")
+
+        # pro grace period
+        self._last_command_ts: float | None = None
+        self._last_command_target: bool | None = None
+
+        _LOGGER.debug(
+            "Creating SemsSwitch (v%s) for Wallbox %s, initial is_on=%s",
+            SWITCH_VERSION,
+            self.sn,
+            self._attr_is_on,
+        )
+
+    # ---------- základní vlastnosti ----------
 
     @property
     def name(self) -> str:
         """Return the name of the switch."""
-        return f"Start charging"
+        return "Start charging"
 
     @property
     def device_class(self):
@@ -120,15 +98,12 @@ class SemsSwitch(CoordinatorEntity, SwitchEntity):
 
     @property
     def unique_id(self) -> str:
-        return f"{self.coordinator.data[self.sn]["sn"]}-switch-start-charging"
+        return f"{self.coordinator.data[self.sn]['sn']}-switch-start-charging"
 
     @property
     def device_info(self):
         return {
-            "identifiers": {
-                # Serial numbers are unique identifiers within a specific domain
-                (DOMAIN, self.sn)
-            },
+            "identifiers": {(DOMAIN, self.sn)},
             "name": self.name,
             "manufacturer": "GoodWe",
         }
@@ -138,46 +113,125 @@ class SemsSwitch(CoordinatorEntity, SwitchEntity):
         """Return if entity is available."""
         return self.coordinator.last_update_success
 
-    @property
-    def is_on(self) -> bool:
-        """Return entity status."""
-        return self.coordinator.data[self.sn]["startStatus"] == 0
+    # ---------- helper pro vyhodnocení stavu z API + grace ----------
+
+    def _compute_is_on_from_data(self, data: dict) -> bool:
+        """Spočítá finální is_on z API + zohlední grace period po posledním příkazu."""
+        status = data.get("status")
+        power = float(data.get("power", 0) or 0)
+
+        api_is_on = status == "EVDetail_Status_Title_Charging" or power > 0
+
+        now = self.hass.loop.time()
+        target = self._last_command_target
+        ts = self._last_command_ts
+
+        # Pokud jsme nedávno poslali ON a API pořád tvrdí "Waiting/power=0",
+        # tak nějakou dobu držíme optimistický ON.
+        if (
+            target is True
+            and ts is not None
+            and now - ts < GRACE_ON_SECONDS
+            and not api_is_on
+        ):
+            _LOGGER.debug(
+                "SemsSwitch %s: within ON grace (%.1fs < %.1fs), "
+                "API status=%s, power=%s -> držím is_on=True",
+                self.sn,
+                now - ts,
+                GRACE_ON_SECONDS,
+                status,
+                power,
+            )
+            return True
+
+        # Pokud jsme nedávno poslali OFF a API ještě krátce ukazuje power>0,
+        # můžeme krátce držet OFF (typicky kratší doba než pro ON).
+        if (
+            target is False
+            and ts is not None
+            and now - ts < GRACE_OFF_SECONDS
+            and api_is_on
+        ):
+            _LOGGER.debug(
+                "SemsSwitch %s: within OFF grace (%.1fs < %.1fs), "
+                "API status=%s, power=%s -> držím is_on=False",
+                self.sn,
+                now - ts,
+                GRACE_OFF_SECONDS,
+                status,
+                power,
+            )
+            return False
+
+        # Mimo grace period nebo stav už sedí – přebíráme přímo z API
+        if target is not None and api_is_on == target:
+            # Stav z API už odpovídá poslednímu příkazu, můžeme grace „vyčistit“
+            self._last_command_target = None
+            self._last_command_ts = None
+
+        _LOGGER.debug(
+            "SemsSwitch %s: API status=%s, power=%s -> is_on=%s (no grace override)",
+            self.sn,
+            status,
+            power,
+            api_is_on,
+        )
+        return api_is_on
+
+    # ---------- ovládání switche ----------
 
     async def async_turn_off(self, **kwargs):
-        _LOGGER.debug(f"Wallbox {self.sn} set to Off")
-        await self.hass.async_add_executor_job(self.api.change_status, self.sn, 2)
-        await self.coordinator.async_request_refresh()
-        startStatus = self.coordinator.data[self.sn]["startStatus"]
-        self._attr_is_on = startStatus == 0
-        _LOGGER.debug(f"Setting switch is_on to {startStatus == 0}")
+        _LOGGER.debug("Wallbox %s set to Off (optimistic UI + OFF grace)", self.sn)
+
+        # 1) uložíme info o příkazu pro grace logiku
+        self._last_command_target = False
+        self._last_command_ts = self.hass.loop.time()
+
+        # 2) OPTIMISTICKY přepneme UI hned
+        self._attr_is_on = False
         self.async_write_ha_state()
 
+        # 3) naplánujeme refresh z API (NEčekáme na něj)
+        self.hass.async_create_task(self.coordinator.async_request_refresh())
+
+        # 4) pošleme příkaz na SEMS API
+        await self.hass.async_add_executor_job(self.api.change_status, self.sn, 2)
+
     async def async_turn_on(self, **kwargs):
-        _LOGGER.debug(f"Wallbox {self.sn} set to On")
-        await self.hass.async_add_executor_job(self.api.change_status, self.sn, 1)
-        await self.coordinator.async_request_refresh()
-        startStatus = self.coordinator.data[self.sn]["startStatus"]
-        self._attr_is_on = startStatus == 0
-        _LOGGER.debug(f"Setting switch is_on to {startStatus == 0}")
+        _LOGGER.debug("Wallbox %s set to On (optimistic UI + ON grace)", self.sn)
+
+        # 1) uložíme info o příkazu pro grace logiku
+        self._last_command_target = True
+        self._last_command_ts = self.hass.loop.time()
+
+        # 2) OPTIMISTICKY přepneme UI hned
+        self._attr_is_on = True
         self.async_write_ha_state()
+
+        # 3) naplánujeme refresh z API (NEčekáme na něj)
+        self.hass.async_create_task(self.coordinator.async_request_refresh())
+
+        # 4) pošleme příkaz na SEMS API
+        await self.hass.async_add_executor_job(self.api.change_status, self.sn, 1)
+
+    # ---------- napojení na coordinator ----------
 
     async def async_added_to_hass(self):
         """When entity is added to hass."""
-        self.async_on_remove(
-            self.coordinator.async_add_listener(self.async_write_ha_state)
-        )
+        await super().async_added_to_hass()
+        _LOGGER.debug("SemsSwitch added to hass for wallbox %s", self.sn)
 
     @callback
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
-        startStatus = self.coordinator.data[self.sn]["startStatus"]
-        _LOGGER.debug(f"Handling coordinator update {startStatus == 0}")
-        self._attr_is_on = startStatus == 0
+        data = self.coordinator.data[self.sn]
+        self._attr_is_on = self._compute_is_on_from_data(data)
         self.async_write_ha_state()
 
     async def async_update(self) -> None:
+        """Manual update (např. z UI)."""
         await self.coordinator.async_request_refresh()
-        startStatus = self.coordinator.data[self.sn]["startStatus"]
-        self._attr_is_on = startStatus == 0
-        _LOGGER.debug(f"Updating SemsSwitch for Wallbox state to {startStatus == 0}")
+        data = self.coordinator.data[self.sn]
+        self._attr_is_on = self._compute_is_on_from_data(data)
         self.async_write_ha_state()

@@ -1,241 +1,139 @@
 """
-Support for power production statistics from GoodWe SEMS API.
+Support for wallbox sensors from GoodWe SEMS API.
 
 For more details about this platform, please refer to the documentation at
 https://github.com/TimSoethout/goodwe-sems-home-assistant
 """
 
-from datetime import timedelta
+from __future__ import annotations
+
 from decimal import Decimal
 import logging
+from typing import Any
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
     SensorStateClass,
 )
-from homeassistant.const import CONF_SCAN_INTERVAL, UnitOfEnergy, UnitOfPower
+from homeassistant.const import UnitOfEnergy, UnitOfPower
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.update_coordinator import (
-    CoordinatorEntity,
-    DataUpdateCoordinator,
-    UpdateFailed,
-)
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import CONF_STATION_ID, DEFAULT_SCAN_INTERVAL, DOMAIN
+from .const import DOMAIN
+from .coordinator import SemsUpdateCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
 
-async def async_setup_entry(hass, config_entry, async_add_entities):
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
     """Add sensors for passed config_entry in HA."""
-    # _LOGGER.debug("hass.data[DOMAIN] %s", hass.data[DOMAIN])
-    semsApi = hass.data[DOMAIN][config_entry.entry_id]
-    stationId = config_entry.data[CONF_STATION_ID]
+    runtime: dict[str, Any] = hass.data[DOMAIN][config_entry.entry_id]
+    coordinator: SemsUpdateCoordinator = runtime["coordinator"]
 
-    # _LOGGER.debug("config_entry %s", config_entry.data)
-    update_interval = timedelta(
-        seconds=config_entry.data.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
-    )
+    # V tuto chvíli už má coordinator data (první refresh proběhl v __init__.py)
+    sns = list(coordinator.data.keys())
 
-    async def async_update_data():
-        """Fetch data from API endpoint.
+    entities: list[SensorEntity] = []
+    for sn in sns:
+        entities.append(SemsSensor(coordinator, sn))
+        entities.append(SemsStatisticsSensor(coordinator, sn))
+        entities.append(SemsPowerSensor(coordinator, sn))
 
-        This is the place to pre-process the data to lookup tables
-        so entities can quickly look up their data.
-        """
-        try:
-            # Note: asyncio.TimeoutError and aiohttp.ClientError are already
-            # handled by the data update coordinator.
-            # async with async_timeout.timeout(10):
-            result = await hass.async_add_executor_job(semsApi.getData, stationId)
-            _LOGGER.debug("Resulting result: %s", result)
-
-            inverter = result
-
-            data = {}
-            if inverter is None:
-                # something went wrong, probably token could not be fetched
-                raise UpdateFailed(  # noqa: TRY301
-                    "Error communicating with API, probably token could not be fetched, see debug logs"
-                )
-
-            name = inverter["name"]
-            sn = inverter["sn"]
-            _LOGGER.debug("Found wallbox attribute %s %s", name, sn)
-            data[sn] = inverter
-
-            # _LOGGER.debug("Resulting data: %s", data)
-            return data
-        # except ApiError as err:
-        except Exception as err:
-            # logging.exception("Something awful happened!")
-            raise UpdateFailed(f"Error communicating with API: {err}")
-
-    coordinator = DataUpdateCoordinator(
-        hass,
-        _LOGGER,
-        # Name of the data. For logging purposes.
-        name="SEMS API",
-        update_method=async_update_data,
-        # Polling interval. Will only be polled if there are subscribers.
-        update_interval=update_interval,
-    )
-
-    #
-    # Fetch initial data so we have data when entities subscribe
-    #
-    # If the refresh fails, async_config_entry_first_refresh will
-    # raise ConfigEntryNotReady and setup will try again later
-    #
-    # If you do not want to retry setup on failure, use
-    # coordinator.async_refresh() instead
-    #
-    await coordinator.async_config_entry_first_refresh()
-
-    # _LOGGER.debug("Initial coordinator data: %s", coordinator.data)
-    async_add_entities(
-        SemsSensor(coordinator, ent) for idx, ent in enumerate(coordinator.data)
-    )
-    async_add_entities(
-        SemsStatisticsSensor(coordinator, ent)
-        for idx, ent in enumerate(coordinator.data)
-    )
-    async_add_entities(
-        SemsPowerSensor(coordinator, ent) for idx, ent in enumerate(coordinator.data)
-    )
+    async_add_entities(entities)
 
 
 class SemsSensor(CoordinatorEntity, SensorEntity):
-    """SemsSensor using CoordinatorEntity.
+    """Hlavní stav wallboxu (Charging / Standby / Offline / Unknown)."""
 
-    The CoordinatorEntity class provides:
-      should_poll
-      async_update
-      async_added_to_hass
-      available
-    """
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options = ["Charging", "Standby", "Offline", "Unknown"]
+    _attr_should_poll = False
 
-    def __init__(self, coordinator, sn) -> None:
-        """Pass coordinator to CoordinatorEntity."""
+    def __init__(self, coordinator: SemsUpdateCoordinator, sn: str) -> None:
+        """Initialize the status sensor."""
         super().__init__(coordinator)
-        self.coordinator = coordinator
         self.sn = sn
         _LOGGER.debug("Creating SemsSensor with id %s", self.sn)
 
     @property
-    def device_class(self):
-        return SensorDeviceClass.ENUM
-
-    @property
-    def options(self):
-        return ["Charging", "Standby", "Offline", "Unknown"]
-
-    @property
     def name(self) -> str:
         """Return the name of the sensor."""
-        return f"Wallbox {self.coordinator.data[self.sn]['model']}"
+        model = self.coordinator.data.get(self.sn, {}).get("model", "Wallbox")
+        return f"Wallbox {model}"
 
     @property
     def unique_id(self) -> str:
-        return self.coordinator.data[self.sn]["sn"]
+        """Unique ID based on serial number."""
+        return self.coordinator.data.get(self.sn, {}).get("sn", self.sn)
 
     @property
-    def state(self):
-        """Return the state of the device."""
-        # _LOGGER.debug("state, coordinator data: %s", self.coordinator.data)
-        # _LOGGER.debug("self.sn: %s", self.sn)
-        # _LOGGER.debug(
-        #     "state, self data: %s", self.coordinator.data[self.sn]
-        # )
-        data = self.coordinator.data[self.sn]
-        if data["status"] == "EVDetail_Status_Title_Charging":
+    def state(self) -> str:
+        """Return the state of the device as human readable string."""
+        data = self.coordinator.data.get(self.sn, {})
+        status = data.get("status")
+
+        if status == "EVDetail_Status_Title_Charging":
             return "Charging"
-        elif data["status"] == "EVDetail_Status_Title_Waiting":
+        if status == "EVDetail_Status_Title_Waiting":
             return "Standby"
-        elif data["status"] == "EVDetail_Status_Title_Offline":
+        if status == "EVDetail_Status_Title_Offline":
             return "Offline"
-        else:
-            return "Unknown"
+        return "Unknown"
 
-    # For backwards compatibility
     @property
-    def extra_state_attributes(self):
+    def extra_state_attributes(self) -> dict[str, Any]:
         """Return the state attributes of the monitored installation."""
-        data = self.coordinator.data[self.sn]
-        # _LOGGER.debug("state, self data: %s", data.items())
-        attributes = {k: v for k, v in data.items() if k is not None and v is not None}
-        attributes["statusText"] = data["status"]
+        data = self.coordinator.data.get(self.sn, {}) or {}
+        attributes = {
+            k: v for k, v in data.items() if k is not None and v is not None
+        }
+        if "status" in data:
+            attributes["statusText"] = data["status"]
         return attributes
 
     @property
-    def is_on(self) -> bool:
-        """Return entity status."""
-        return self.coordinator.data[self.sn]["status"] is not None
-
-    @property
-    def should_poll(self) -> bool:
-        """No need to poll. Coordinator notifies entity of updates."""
-        return False
-
-    @property
-    def available(self):
+    def available(self) -> bool:
         """Return if entity is available."""
         return self.coordinator.last_update_success
 
     @property
-    def device_info(self):
-        # _LOGGER.debug("self.device_state_attributes: %s", self.device_state_attributes)
+    def device_info(self) -> dict[str, Any]:
+        data = self.coordinator.data.get(self.sn, {}) or {}
         return {
-            "identifiers": {
-                # Serial numbers are unique identifiers within a specific domain
-                (DOMAIN, self.sn)
-            },
+            "identifiers": {(DOMAIN, self.sn)},
             "name": self.name,
             "manufacturer": "GoodWe",
-            "model": self.extra_state_attributes.get("model", "unknown"),
-            "sw_version": self.extra_state_attributes.get("fireware", "unknown"),
-            # "via_device": (DOMAIN, self.api.bridgeid),
+            "model": data.get("model", "unknown"),
+            "sw_version": data.get("fireware", "unknown"),
         }
 
-    async def async_added_to_hass(self):
+    async def async_added_to_hass(self) -> None:
         """When entity is added to hass."""
-        self.async_on_remove(
-            self.coordinator.async_add_listener(self.async_write_ha_state)
-        )
+        await super().async_added_to_hass()
 
-    async def async_update(self):
-        """Update the entity.
-
-        Only used by the generic entity update service.
-        """
+    async def async_update(self) -> None:
+        """Update the entity via the coordinator."""
         await self.coordinator.async_request_refresh()
 
 
 class SemsPowerSensor(CoordinatorEntity, SensorEntity):
-    """SemsSensor using CoordinatorEntity.
+    """Instant power sensor in kW."""
 
-    The CoordinatorEntity class provides:
-      should_poll
-      async_update
-      async_added_to_hass
-      available
-    """
+    _attr_device_class = SensorDeviceClass.POWER
+    _attr_should_poll = False
+    _attr_native_unit_of_measurement = UnitOfPower.KILO_WATT
 
-    def __init__(self, coordinator, sn):
-        """Pass coordinator to CoordinatorEntity."""
+    def __init__(self, coordinator: SemsUpdateCoordinator, sn: str) -> None:
         super().__init__(coordinator)
-        self.coordinator = coordinator
         self.sn = sn
         _LOGGER.debug("Creating SemsPowerSensor with id %s", self.sn)
-
-    @property
-    def device_class(self):
-        return SensorDeviceClass.POWER
-
-    @property
-    def unit_of_measurement(self):
-        return UnitOfPower.KILO_WATT
 
     @property
     def name(self) -> str:
@@ -244,130 +142,95 @@ class SemsPowerSensor(CoordinatorEntity, SensorEntity):
 
     @property
     def unique_id(self) -> str:
-        return f"{self.coordinator.data[self.sn]['sn']}_power"
+        """Unique ID for power sensor."""
+        sn = self.coordinator.data.get(self.sn, {}).get("sn", self.sn)
+        return f"{sn}_power"
 
     @property
-    def state(self):
-        """Return the state of the device."""
-        # _LOGGER.debug("state, coordinator data: %s", self.coordinator.data)
-        # _LOGGER.debug("self.sn: %s", self.sn)
-        # _LOGGER.debug(
-        #     "state, self data: %s", self.coordinator.data[self.sn]
-        # )
-        data = self.coordinator.data[self.sn]
-        return max(0, float(data["power"]))
+    def native_value(self) -> float:
+        """Return the power in kW."""
+        data = self.coordinator.data.get(self.sn, {}) or {}
+        try:
+            power = float(data.get("power", 0) or 0)
+        except (TypeError, ValueError):
+            power = 0.0
+        return max(0.0, power)
 
     @property
-    def should_poll(self) -> bool:
-        """No need to poll. Coordinator notifies entity of updates."""
-        return False
-
-    @property
-    def available(self):
-        """Return if entity is available."""
+    def available(self) -> bool:
         return self.coordinator.last_update_success
 
     @property
-    def device_info(self):
-        # _LOGGER.debug("self.device_state_attributes: %s", self.device_state_attributes)
-        data = self.coordinator.data[self.sn]
+    def device_info(self) -> dict[str, Any]:
+        data = self.coordinator.data.get(self.sn, {}) or {}
         return {
-            "identifiers": {
-                # Serial numbers are unique identifiers within a specific domain
-                (DOMAIN, self.sn)
-            },
-            # "name": self.name,
+            "identifiers": {(DOMAIN, self.sn)},
             "manufacturer": "GoodWe",
             "model": data.get("model", "unknown"),
             "sw_version": data.get("fireware", "unknown"),
-            # "via_device": (DOMAIN, self.api.bridgeid),
         }
 
-    async def async_added_to_hass(self):
-        """When entity is added to hass."""
-        self.async_on_remove(
-            self.coordinator.async_add_listener(self.async_write_ha_state)
-        )
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
 
-    async def async_update(self):
-        """Update the entity.
-
-        Only used by the generic entity update service.
-        """
+    async def async_update(self) -> None:
         await self.coordinator.async_request_refresh()
 
 
 class SemsStatisticsSensor(CoordinatorEntity, SensorEntity):
-    """Sensor in kWh to enable HA statistics, in the end usable in the power component."""
+    """Energy sensor in kWh to enable HA statistics."""
 
-    def __init__(self, coordinator, sn):
-        """Pass coordinator to CoordinatorEntity."""
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_should_poll = False
+    _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+
+    def __init__(self, coordinator: SemsUpdateCoordinator, sn: str) -> None:
         super().__init__(coordinator)
-        self.coordinator = coordinator
         self.sn = sn
         _LOGGER.debug("Creating SemsStatisticsSensor with id %s", self.sn)
 
     @property
-    def device_class(self):
-        return SensorDeviceClass.ENERGY
-
-    @property
-    def native_unit_of_measurement(self):
-        return UnitOfEnergy.KILO_WATT_HOUR
-
-    @property
-    def state_class(self):
-        return SensorStateClass.TOTAL_INCREASING
-
-    @property
     def native_value(self) -> Decimal:
-        """Return the value reported by the sensor."""
-        return self.coordinator.data[self.sn]["chargeEnergy"]
+        """Return the value reported by the sensor (kWh)."""
+        data = self.coordinator.data.get(self.sn, {}) or {}
+        raw = data.get("chargeEnergy", 0)
+
+        # API vrací string – ošetříme to defensivně.
+        try:
+            return Decimal(str(raw))
+        except Exception:  # noqa: BLE001
+            _LOGGER.debug(
+                "Unable to parse chargeEnergy=%s for %s, falling back to 0", raw, self.sn
+            )
+            return Decimal("0")
 
     @property
-    def available(self):
-        """Return if entity is available."""
+    def available(self) -> bool:
         return self.coordinator.last_update_success
 
     @property
     def name(self) -> str:
         """Return the name of the sensor."""
-        return f"Wallbox Energy"
+        return "Wallbox Energy"
 
     @property
     def unique_id(self) -> str:
-        return f"{self.coordinator.data[self.sn]['sn']}-energy"
+        sn = self.coordinator.data.get(self.sn, {}).get("sn", self.sn)
+        return f"{sn}-energy"
 
     @property
-    def should_poll(self) -> bool:
-        """No need to poll. Coordinator notifies entity of updates."""
-        return False
-
-    @property
-    def device_info(self):
-        # _LOGGER.debug("self.device_state_attributes: %s", self.device_state_attributes)
-        data = self.coordinator.data[self.sn]
+    def device_info(self) -> dict[str, Any]:
+        data = self.coordinator.data.get(self.sn, {}) or {}
         return {
-            "identifiers": {
-                # Serial numbers are unique identifiers within a specific domain
-                (DOMAIN, self.sn)
-            },
-            # "name": self.name,
+            "identifiers": {(DOMAIN, self.sn)},
             "manufacturer": "GoodWe",
             "model": data.get("model", "unknown"),
             "sw_version": data.get("fireware", "unknown"),
-            # "via_device": (DOMAIN, self.api.bridgeid),
         }
 
-    async def async_added_to_hass(self):
-        """When entity is added to hass."""
-        self.async_on_remove(
-            self.coordinator.async_add_listener(self.async_write_ha_state)
-        )
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
 
-    async def async_update(self):
-        """Update the entity.
-
-        Only used by the generic entity update service.
-        """
+    async def async_update(self) -> None:
         await self.coordinator.async_request_refresh()

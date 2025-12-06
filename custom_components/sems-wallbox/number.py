@@ -1,124 +1,77 @@
 """
-Support for switch controlling an output of a GoodWe SEMS inverter.
-
-For more details about this platform, please refer to the documentation at
-https://github.com/TimSoethout/goodwe-sems-home-assistant
+Support for number entity controlling GoodWe SEMS Wallbox charge power.
 """
 
-from datetime import timedelta
+from __future__ import annotations
+
 import logging
 
 from homeassistant.components.number import (
     NumberDeviceClass,
     NumberEntity,
-    NumberEntityDescription,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_SCAN_INTERVAL, UnitOfPower
-from homeassistant.core import Event, HomeAssistant, callback
-from homeassistant.helpers.entity import Entity
-from homeassistant.helpers.update_coordinator import (
-    CoordinatorEntity,
-    DataUpdateCoordinator,
-    UpdateFailed,
-)
+    # type: ignore[import]
+from homeassistant.const import UnitOfPower
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import CONF_STATION_ID, DEFAULT_SCAN_INTERVAL, DOMAIN
+from .const import DOMAIN
+from .coordinator import SemsUpdateCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
+NUMBER_VERSION = "0.3.1"
 
-async def async_setup_entry(hass, config_entry, async_add_entities):
-    """Add switches for passed config_entry in HA."""
-    semsApi = hass.data[DOMAIN][config_entry.entry_id]
-    stationId = config_entry.data[CONF_STATION_ID]
 
-    update_interval = timedelta(
-        seconds=config_entry.data.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    """Add numbers for passed config_entry in HA."""
+    runtime = hass.data[DOMAIN][config_entry.entry_id]
+    coordinator: SemsUpdateCoordinator = runtime["coordinator"]
+    api = runtime["api"]
+
+    _LOGGER.debug(
+        "Setting up SemsNumber entities (version %s) for entry %s",
+        NUMBER_VERSION,
+        config_entry.entry_id,
     )
 
-    set_charge_power = 0
+    entities: list[SemsNumber] = []
+    for sn, data in coordinator.data.items():
+        set_charge_power = data.get("set_charge_power")
+        entities.append(SemsNumber(coordinator, sn, api, set_charge_power))
 
-    async def async_update_data():
-        """Fetch data from API endpoint.
-
-        This is the place to pre-process the data to lookup tables
-        so entities can quickly look up their data.
-        """
-        try:
-            # Note: asyncio.TimeoutError and aiohttp.ClientError are already
-            # handled by the data update coordinator.
-            # async with async_timeout.timeout(10):
-            result = await hass.async_add_executor_job(semsApi.getData, stationId)
-            _LOGGER.debug("Resulting result: %s", result)
-
-            inverter = result
-
-            data = {}
-            if inverter is None:
-                # something went wrong, probably token could not be fetched
-                raise UpdateFailed(
-                    "Error communicating with API, probably token could not be fetched, see debug logs"
-                )
-
-            name = inverter["name"]
-            sn = inverter["sn"]
-            nonlocal set_charge_power
-            set_charge_power = inverter["set_charge_power"]
-            _LOGGER.debug("Found wallbox attribute %s %s set_charge_power", name, sn)
-            data[sn] = inverter
-
-            # _LOGGER.debug("Resulting data: %s", data)
-            return data
-        # except ApiError as err:
-        except Exception as err:
-            # logging.exception("Something awful happened!")
-            raise UpdateFailed(f"Error communicating with API: {err}")
-
-    coordinator = DataUpdateCoordinator(
-        hass,
-        _LOGGER,
-        # Name of the data. For logging purposes.
-        name="SEMS API number",
-        update_method=async_update_data,
-        # Polling interval. Will only be polled if there are subscribers.
-        update_interval=update_interval,
-    )
-
-    #
-    # Fetch initial data so we have data when entities subscribe
-    #
-    # If the refresh fails, async_config_entry_first_refresh will
-    # raise ConfigEntryNotReady and setup will try again later
-    #
-    # If you do not want to retry setup on failure, use
-    # coordinator.async_refresh() instead
-    #
-    await coordinator.async_config_entry_first_refresh()
-
-    # _LOGGER.debug("Initial coordinator data: %s", coordinator.data)
-    async_add_entities(
-        SemsNumber(coordinator, ent, semsApi, set_charge_power)
-        for idx, ent in enumerate(coordinator.data)
-    )
+    async_add_entities(entities)
 
 
 class SemsNumber(CoordinatorEntity, NumberEntity):
+    """Number entity for setting wallbox charge power."""
+
     _attr_should_poll = False
     _attr_has_entity_name = True
 
-    def __init__(self, coordinator, sn, api, value: float):
+    def __init__(self, coordinator: SemsUpdateCoordinator, sn: str, api, value: float):
         super().__init__(coordinator)
         self.coordinator = coordinator
         self.api = api
         self.sn = sn
         self._attr_native_value = float(value) if value is not None else None
-        _LOGGER.debug(f"Creating SemsNumber for Wallbox {self.sn}")
+        _LOGGER.debug(
+            "Creating SemsNumber (v%s) for Wallbox %s, initial value=%s",
+            NUMBER_VERSION,
+            self.sn,
+            self._attr_native_value,
+        )
 
     @property
     def name(self) -> str:
-        """Return the name of the switch."""
-        return f"Wallbox set charge power"
+        """Return the name of the number entity."""
+        return "Wallbox set charge power"
 
     @property
     def device_class(self):
@@ -142,46 +95,90 @@ class SemsNumber(CoordinatorEntity, NumberEntity):
 
     @property
     def unique_id(self) -> str:
-        return f"{self.coordinator.data[self.sn]["sn"]}_number_set_charge_power"
+        # stejné chování, jen f-string
+        return f"{self.coordinator.data[self.sn]['sn']}_number_set_charge_power"
 
     @property
     def device_info(self):
         return {
-            "identifiers": {
-                # Serial numbers are unique identifiers within a specific domain
-                (DOMAIN, self.sn)
-            },
+            "identifiers": {(DOMAIN, self.sn)},
             "name": self.name,
             "manufacturer": "GoodWe",
         }
 
     async def async_added_to_hass(self):
         """When entity is added to hass."""
+        await super().async_added_to_hass()
         self.async_on_remove(
             self.coordinator.async_add_listener(self.async_write_ha_state)
         )
+        _LOGGER.debug("SemsNumber added to hass for wallbox %s", self.sn)
 
     @callback
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
-        set_charge_power = self.coordinator.data[self.sn]["set_charge_power"]
-        self._attr_native_value = float(set_charge_power)
-        _LOGGER.debug("Handling coordinator update set_charge_power")
+        data = self.coordinator.data[self.sn]
+        set_charge_power = data.get("set_charge_power")
+        if set_charge_power is not None:
+            try:
+                self._attr_native_value = float(set_charge_power)
+            except (TypeError, ValueError):
+                _LOGGER.warning(
+                    "SemsNumber %s: invalid set_charge_power value %r from API",
+                    self.sn,
+                    set_charge_power,
+                )
+        _LOGGER.debug(
+            "SemsNumber coordinator update SN=%s → native_value=%s",
+            self.sn,
+            self._attr_native_value,
+        )
         self.async_write_ha_state()
 
     async def async_update(self) -> None:
-        await self.coordinator.async_refresh()
-        set_charge_power = self.coordinator.data[self.sn]["set_charge_power"]
-        self._attr_native_value = float(set_charge_power)
-        _LOGGER.debug(f"Updating SemsNumber for Wallbox state to {set_charge_power}")
+        """Manual update from HA (e.g. z UI)."""
+        await self.coordinator.async_request_refresh()
+        data = self.coordinator.data[self.sn]
+        set_charge_power = data.get("set_charge_power")
+        if set_charge_power is not None:
+            try:
+                self._attr_native_value = float(set_charge_power)
+            except (TypeError, ValueError):
+                _LOGGER.warning(
+                    "SemsNumber %s: invalid set_charge_power value %r from API (async_update)",
+                    self.sn,
+                    set_charge_power,
+                )
+        _LOGGER.debug(
+            "Updating SemsNumber for Wallbox %s state to %s (async_update)",
+            self.sn,
+            self._attr_native_value,
+        )
         self.async_write_ha_state()
 
     async def async_set_native_value(self, value: float) -> None:
-        active_mode = self.coordinator.data[self.sn]["chargeMode"]
-        _LOGGER.debug(f"Setting set_charge_power to {value}")
-        await self.hass.async_add_executor_job(
-            self.api.set_charge_mode, self.sn, 0 if value > 4.2 else active_mode, value
+        """Handle change from UI slider."""
+        data = self.coordinator.data.get(self.sn, {})
+        active_mode = data.get("chargeMode", 0)
+
+        _LOGGER.debug(
+            "Setting set_charge_power for SN=%s to %s (active_mode=%s)",
+            self.sn,
+            value,
+            active_mode,
         )
-        await self.coordinator.async_request_refresh()
+
+        # 1) Optimisticky nastavíme hodnotu v UI
         self._attr_native_value = float(value)
         self.async_write_ha_state()
+
+        # 2) Zavoláme SEMS API v executor jobu
+        await self.hass.async_add_executor_job(
+            self.api.set_charge_mode,
+            self.sn,
+            0 if value > 4.2 else active_mode,
+            value,
+        )
+
+        # 3) Naplánujeme refresh z API (NEčekáme na něj, aby slider nevisel)
+        self.hass.async_create_task(self.coordinator.async_request_refresh())

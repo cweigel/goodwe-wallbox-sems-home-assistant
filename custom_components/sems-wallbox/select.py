@@ -1,20 +1,14 @@
 import logging
+
 from homeassistant.components.select import SelectEntity, SelectEntityDescription
 from homeassistant.config_entries import ConfigEntry
-
-from homeassistant.core import Event, HomeAssistant
-
+from homeassistant.const import EntityCategory
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.update_coordinator import UpdateFailed
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from homeassistant.const import (
-    STATE_UNAVAILABLE,
-    STATE_UNKNOWN,
-    EntityCategory,
-    Platform,
-)
-
-from .const import DOMAIN, CONF_STATION_ID, DEFAULT_SCAN_INTERVAL
+from .const import DOMAIN
+from .coordinator import SemsUpdateCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -24,9 +18,7 @@ _MODE_TO_OPTION: dict[int, str] = {
     2: "PV & battery",
 }
 
-_OPTION_TO_MODE: dict[str, int] = {
-    value: key for key, value in _MODE_TO_OPTION.items()
-}
+_OPTION_TO_MODE: dict[str, int] = {value: key for key, value in _MODE_TO_OPTION.items()}
 
 OPERATION_MODE = SelectEntityDescription(
     key="charge_mode",
@@ -36,153 +28,138 @@ OPERATION_MODE = SelectEntityDescription(
 
 
 async def async_setup_entry(
-        hass: HomeAssistant,
-        config_entry: ConfigEntry,
-        async_add_entities: AddEntitiesCallback,
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up the inverter select entities from a config entry."""
+    runtime = hass.data[DOMAIN][config_entry.entry_id]
+    coordinator: SemsUpdateCoordinator = runtime["coordinator"]
+    api = runtime["api"]
 
-    semsApi = hass.data[DOMAIN][config_entry.entry_id]
-    stationId = config_entry.data[CONF_STATION_ID]
+    entities: list[InverterOperationModeEntity] = []
 
-    try:
-        result = await hass.async_add_executor_job(semsApi.getData, stationId)
-        inverter = result
+    for sn, inverter in coordinator.data.items():
         active_mode = inverter["chargeMode"]
         current_charge_power = inverter["max_charge_power"]
-
-    except Exception as err:
-        # logging.exception("Something awful happened!")
-        raise UpdateFailed(f"Error communicating with API: {err}")
-    else:
-        _LOGGER.debug(f"InverterOperationModeEntity args: {semsApi}, {inverter["sn"]}, {OPERATION_MODE}, {inverter},"
-                      f" {[v for k, v in _MODE_TO_OPTION.items()]}, {_MODE_TO_OPTION.get(active_mode)}, {current_charge_power} ")
-        entity = InverterOperationModeEntity(
-            semsApi,
-            inverter["sn"],
-            OPERATION_MODE,
-            inverter,
-            [v for k, v in _MODE_TO_OPTION.items()],
-            _MODE_TO_OPTION.get(active_mode),
-            current_charge_power,
+        entities.append(
+            InverterOperationModeEntity(
+                coordinator,
+                api,
+                sn,
+                OPERATION_MODE,
+                list(_MODE_TO_OPTION.values()),
+                _MODE_TO_OPTION.get(active_mode),
+                current_charge_power,
+            )
         )
 
-    async_add_entities([entity])
-
-    # eco_mode_power_entity_id = er.async_get(hass).async_get_entity_id(
-    #     Platform.NUMBER,
-    #     DOMAIN,
-    #     f"{DOMAIN}-eco_mode_power-{inverter.serial_number}",
-    # )
-    # if eco_mode_power_entity_id:
-    #     async_track_state_change_event(
-    #         hass,
-    #         eco_mode_power_entity_id,
-    #         entity.update_eco_mode_power,
-    #     )
+    async_add_entities(entities)
 
 
-class InverterOperationModeEntity(SelectEntity):
+class InverterOperationModeEntity(CoordinatorEntity, SelectEntity):
     """Entity representing the inverter operation mode."""
 
     _attr_should_poll = False
     _attr_has_entity_name = True
 
     def __init__(
-            self,
-            api,
-            sn,
-            description: SelectEntityDescription,
-            inverter,
-            supported_options: list[str],
-            current_mode: str,
-            current_charge_power: int,
+        self,
+        coordinator: SemsUpdateCoordinator,
+        api,
+        sn: str,
+        description: SelectEntityDescription,
+        supported_options: list[str],
+        current_mode: str,
+        current_charge_power: int,
     ) -> None:
-        super().__init__()
-        """Initialize the inverter operation mode setting entity."""
+        super().__init__(coordinator)
+        self.coordinator = coordinator
         self.api = api
         self.sn = sn
         self.entity_description = description
         self._attr_unique_id = f"{self.sn}-select-charge-mode"
         self._attr_options = supported_options
         self._attr_current_option = str(current_mode)
-        self._inverter = inverter
         self._current_charge_power = current_charge_power
 
-        _LOGGER.debug(f"Creating SelectEntity for Wallbox {self.sn}")
+        _LOGGER.debug("Creating SelectEntity for Wallbox %s", self.sn)
 
     @property
     def name(self) -> str:
         """Return the name of the sensor."""
-        return f"Wallbox {self._inverter['model']}"
+        inverter = self.coordinator.data[self.sn]
+        return f"Wallbox {inverter['model']}"
 
     @property
     def device_info(self):
-        # _LOGGER.debug("self.device_state_attributes: %s", self.device_state_attributes)
         return {
-            "identifiers": {
-                # Serial numbers are unique identifiers within a specific domain
-                (DOMAIN, self.sn)
-            },
+            "identifiers": {(DOMAIN, self.sn)},
             "name": self.name,
             "manufacturer": "GoodWe",
         }
 
     async def async_select_option(self, option: str) -> None:
         """Change the selected option."""
+        if option not in _OPTION_TO_MODE:
+            _LOGGER.warning(
+                "Unknown operation mode option %s for wallbox %s",
+                option,
+                self.sn,
+            )
+            return
+
+        mode = _OPTION_TO_MODE[option]
+
         _LOGGER.debug(
-            "Setting operation mode to %s, power %d",
+            "Setting operation mode for wallbox %s to %s (mode=%s, power=%s)",
+            self.sn,
             option,
+            mode,
             self._current_charge_power,
         )
 
-        await self.hass.async_add_executor_job(self.api.set_charge_mode, self.sn, _OPTION_TO_MODE[option], self._current_charge_power)
-
+        # Optimistický update v UI
         self._attr_current_option = option
         self.async_write_ha_state()
 
-    async def async_update(self) -> None:
-        try:
-            # Note: asyncio.TimeoutError and aiohttp.ClientError are already
-            # handled by the data update coordinator.
-            # async with async_timeout.timeout(10):
-            result = await self.api.getData(self.sn)
-            _LOGGER.debug("Resulting result: %s", result)
+        # Volání SEMS API v executor threadu
+        await self.hass.async_add_executor_job(
+            self.api.set_charge_mode,
+            self.sn,
+            mode,
+            self._current_charge_power,
+        )
 
-            inverter = result
+        # Jen naplánovat refresh – nečekat na něj přímo, aby UI neblokovalo
+        self.hass.async_create_task(self.coordinator.async_request_refresh())
 
-            if inverter is None:
-                # something went wrong, probably token could not be fetched
-                raise UpdateFailed(
-                    "Error communicating with API, probably token could not be fetched, see debug logs"
-                )
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+        inverter = self.coordinator.data[self.sn]
+        mode = inverter["chargeMode"]
+        charge_power = inverter["max_charge_power"]
+        _LOGGER.debug(
+            "Coordinator update for wallbox %s: chargeMode=%s, max_charge_power=%s",
+            self.sn,
+            mode,
+            charge_power,
+        )
 
-            mode = inverter["chargeMode"]
-            charge_power = inverter["max_charge_power"]
-            _LOGGER.debug("Got wallbox charge mode %s and power %s", mode, charge_power)
+        # Přemapování na option + aktualizace uloženého výkonu
+        if mode in _MODE_TO_OPTION:
+            self._attr_current_option = _MODE_TO_OPTION[mode]
+        else:
+            _LOGGER.warning(
+                "Unknown chargeMode %s for wallbox %s in coordinator update",
+                mode,
+                self.sn,
+            )
 
-        # except ApiError as err:
-        except Exception as err:
-            # logging.exception("Something awful happened!")
-            raise UpdateFailed(f"Error communicating with API: {err}")
-
-        self._attr_current_option = _MODE_TO_OPTION[mode]
         self._current_charge_power = charge_power
+        self.async_write_ha_state()
 
-    # async def update_eco_mode_power(self, event: Event) -> None:
-    #     """Update eco mode power value in inverter (when in eco mode)."""
-    #     state = event.data.get("new_state")
-    #     if state is None or state.state in (STATE_UNKNOWN, "", STATE_UNAVAILABLE):
-    #         return
-    #
-    #     self._eco_mode_power = int(float(state.state))
-    #     if event.data.get("old_state"):
-    #         operation_mode = _OPTION_TO_MODE[self.current_option]
-    #         if operation_mode in (
-    #             OperationMode.ECO_CHARGE,
-    #             OperationMode.ECO_DISCHARGE,
-    #         ):
-    #             _LOGGER.debug("Setting eco mode power to %d", self._eco_mode_power)
-    #             await self._inverter.set_operation_mode(
-    #                 operation_mode, self._eco_mode_power, self._eco_mode_soc
-    #             )
+    async def async_update(self) -> None:
+        """Trigger coordinator refresh when entity is updated."""
+        await self.coordinator.async_request_refresh()
